@@ -38,7 +38,7 @@ function refreshRadarLayer() {
     const container = radarLayer.getContainer?.();
     if (container) {
       container.style.imageRendering = "auto";
-      container.style.filter = "blur(15px) brightness(0.75) contrast(2)";
+      container.style.filter = "blur(1px) brightness(0.75) contrast(2)";
     }
   }, 500);
 }

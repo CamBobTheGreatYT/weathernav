@@ -163,7 +163,33 @@ function checkHighwayRatio() {
     hwyRt = highwayRatio > 25; //this was originally 50% changed to 25 so that it would actually say going to ny is on the highway and give a correct time estimate
 }
 
+function hasPassedManeuver(idx, userLoc) {
+    if (!routeSteps || !routeSteps[idx]) return false;
+    const man = routeSteps[idx].maneuver.location; // [lon, lat]
+    const manLat = man[1], manLon = man[0];
+    const userLat = userLoc[0], userLon = userLoc[1];
 
+    // Need a "next" point to define forward direction; fall back to route geometry end if missing
+    const next = routeSteps[idx + 1]?.maneuver?.location || window.routeGeometryCoords?.[window.routeGeometryCoords.length - 1];
+    if (!next) return false;
+    const nextLat = next[1], nextLon = next[0];
+
+    // Approx meters conversion
+    const metersPerDegLat = 111320;
+    const metersPerDegLon = Math.cos(manLat * Math.PI / 180) * 111320;
+
+    // Vector from maneuver -> next, and maneuver -> user (in meters)
+    const vx = (nextLon - manLon) * metersPerDegLon;
+    const vy = (nextLat - manLat) * metersPerDegLat;
+    const ux = (userLon - manLon) * metersPerDegLon;
+    const uy = (userLat - manLat) * metersPerDegLat;
+
+    const dot = vx * ux + vy * uy;
+    const distToMan = map.distance(L.latLng(userLat, userLon), L.latLng(manLat, manLon));
+
+    // If the user lies ahead along the maneuver->next direction (dot>0) and is not extremely close, treat as passed.
+    return dot > 0 && distToMan > 50; // 50m buffer, tweak if needed
+}
 
 
 // Begin live tracking
@@ -264,77 +290,27 @@ function beginTracking() {
 
             // Turn alert logic
             if (stepIndex < routeSteps.length) {
-                const nextStep = routeSteps[stepIndex];
-                const target = nextStep.maneuver.location;
-                const distanceToTurn = map.distance(
-                    L.latLng(userLocation[0], userLocation[1]),
-                    L.latLng(target[1], target[0])
-                );
 
-                if (!window.oneMileAlerted && distanceToTurn > 1550 && distanceToTurn < 1650) {
-                    const text = nextStep.maneuver.instruction || `${nextStep.maneuver.type} on ${nextStep.name || "road"}`;
-                    const step = routeSteps[stepIndex];
-                    const modifier = step.maneuver.modifier || "";
-                    const roadName = step.name || "the road";
-
-                    let directionText = "";
-                    switch (modifier) {
-                        case "left": directionText = "Turn left"; break;
-                        case "right": directionText = "Turn right"; break;
-                        case "straight": directionText = "Go straight"; break;
-                        case "slight left": directionText = "Bear left"; break;
-                        case "slight right": directionText = "Bear right"; break;
-                        case "uturn": directionText = "Make a U-turn"; break;
-                        default: directionText = step.maneuver.instruction || `${step.maneuver.type} on ${roadName}`;
-                    }
-
-                    const distanceFormatted = formatDistance(distanceToTurn);
-                    const spokenText = `${directionText} onto ${roadName}`;
-                    speechSynthesis.speak(new SpeechSynthesisUtterance(`In one mile, ${spokenText}`));
-                    window.oneMileAlerted = true;
-                }
-
-
-
-                const prevDist = stepIndex === 0 ? 9999 : routeSteps[stepIndex - 1].distance;
-                const threshold = prevDist > 1609 ? 1609 : 321.87;
-
-                if (!alerted && distanceToTurn < threshold + 100 && distanceToTurn > threshold - 100) {
-                    const step = routeSteps[stepIndex];
-                    const modifier = step.maneuver.modifier || "";
-                    const roadName = step.name || "the road";
-
-                    let directionText = "";
-                    switch (modifier) {
-                        case "left": directionText = "Turn left"; break;
-                        case "right": directionText = "Turn right"; break;
-                        case "straight": directionText = "Go straight"; break;
-                        case "slight left": directionText = "Bear left"; break;
-                        case "slight right": directionText = "Bear right"; break;
-                        case "uturn": directionText = "Make a U-turn"; break;
-                        default: directionText = step.maneuver.instruction || `${step.maneuver.type} on ${roadName}`;
-                    }
-
-                    const maneuverCoord = L.latLng(nextStep.maneuver.location[1], nextStep.maneuver.location[0]);
-                    const userCoord = L.latLng(userLocation[0], userLocation[1]);
-                    const distanceToNext = map.distance(userCoord, maneuverCoord);
-
-                    //make distanceFormatted use the distance to the next turn instead of current
-                    const distanceFormatted = formatDistance(distanceToNext);
-                    const spokenText = `In ${distanceFormatted}, ${directionText} onto ${roadName}`;
-                    speechSynthesis.speak(new SpeechSynthesisUtterance(spokenText));
-                    alerted = true;
-                }
-
-
-                if (distanceToTurn < 30.48) {
+                // If user started mid-route and already past upcoming steps, advance until next is ahead
+                while (stepIndex < routeSteps.length && hasPassedManeuver(stepIndex, userLocation)) {
                     stepIndex++;
                     alerted = false;
                     window.oneMileAlerted = false;
                     updateNextInstruction();
                     updateInstructionList();
+                    updateSpeedLimitDisplay();
+                }
 
-                    if (stepIndex < routeSteps.length) {
+                if (stepIndex < routeSteps.length) {
+                    const nextStep = routeSteps[stepIndex];
+                    const target = nextStep.maneuver.location;
+                    const distanceToTurn = map.distance(
+                        L.latLng(userLocation[0], userLocation[1]),
+                        L.latLng(target[1], target[0])
+                    );
+
+                    if (!window.oneMileAlerted && distanceToTurn > 1550 && distanceToTurn < 1650) {
+                        const text = nextStep.maneuver.instruction || `${nextStep.maneuver.type} on ${nextStep.name || "road"}`;
                         const step = routeSteps[stepIndex];
                         const modifier = step.maneuver.modifier || "";
                         const roadName = step.name || "the road";
@@ -350,34 +326,50 @@ function beginTracking() {
                             default: directionText = step.maneuver.instruction || `${step.maneuver.type} on ${roadName}`;
                         }
 
-                        const distanceFormatted = formatDistance(distanceToTurn);
-                        const spokenText = ` ${directionText} onto ${roadName}`; //"Next, In ${distanceFormatted}," ommited to give better instruction. i think
-                        speechSynthesis.speak(new SpeechSynthesisUtterance(spokenText));
+                        const spokenText = `${directionText} onto ${roadName}`;
+                        speechSynthesis.speak(new SpeechSynthesisUtterance(`In one mile, ${spokenText}`));
+                        window.oneMileAlerted = true;
+                    }
 
-                        /*const nextStep = routeSteps[stepIndex];
-                        const text = nextStep.maneuver.instruction || `${nextStep.maneuver.type} on ${nextStep.name || "road"}`;
+                    const prevDist = stepIndex === 0 ? 9999 : routeSteps[stepIndex - 1].distance;
+                    const threshold = prevDist > 1609 ? 1609 : 321.87;
 
-                        // Calculate distance to next step
-                        let distanceToNext = nextStep.distance;
-                        if (userLocation && nextStep.maneuver.location) {
-                            const maneuverCoord = L.latLng(nextStep.maneuver.location[1], nextStep.maneuver.location[0]);
-                            const userCoord = L.latLng(userLocation[0], userLocation[1]);
-                            distanceToNext = map.distance(userCoord, maneuverCoord);
+                    if (!alerted && distanceToTurn < threshold + 100 && distanceToTurn > threshold - 100) {
+                        const step = routeSteps[stepIndex];
+                        const modifier = step.maneuver.modifier || "";
+                        const roadName = step.name || "the road";
+
+                        let directionText = "";
+                        switch (modifier) {
+                            case "left": directionText = "Turn left"; break;
+                            case "right": directionText = "Turn right"; break;
+                            case "straight": directionText = "Go straight"; break;
+                            case "slight left": directionText = "Bear left"; break;
+                            case "slight right": directionText = "Bear right"; break;
+                            case "uturn": directionText = "Make a U-turn"; break;
+                            default: directionText = step.maneuver.instruction || `${step.maneuver.type} on ${roadName}`;
                         }
+
+                        const maneuverCoord = L.latLng(nextStep.maneuver.location[1], nextStep.maneuver.location[0]);
+                        const userCoord = L.latLng(userLocation[0], userLocation[1]);
+                        const distanceToNext = map.distance(userCoord, maneuverCoord);
+
                         const distanceFormatted = formatDistance(distanceToNext);
+                        const spokenText = `In ${distanceFormatted}, ${directionText} onto ${roadName}`;
+                        speechSynthesis.speak(new SpeechSynthesisUtterance(spokenText));
+                        alerted = true;
+                    }
 
-                        // Optional: estimate time based on assumed speed
-                        const avgSpeed = window.assumedSpeed || window.avgRouteSpeed || 13.4; // meters/sec
-                        const secondsToNext = distanceToNext / avgSpeed;
-                        const minutes = Math.round(secondsToNext / 60);
-
-                        //const timeText = minutes > 0
-                        //    ? `in about ${minutes} minute${minutes > 1 ? "s" : ""}`
-                        //    : `in less than a minute`;
-                        const spokenText = `Next: ${text}, ${distanceFormatted}`;
-                        speechSynthesis.speak(new SpeechSynthesisUtterance(spokenText));*/
+                    if (distanceToTurn < 30.48) {
+                        stepIndex++;
+                        alerted = false;
+                        window.oneMileAlerted = false;
+                        updateNextInstruction();
+                        updateInstructionList();
+                        updateSpeedLimitDisplay();
                     }
                 }
+
                 updateInstructionList();
                 updateNextInstruction();
                 updateSpeedLimitDisplay(); // ⬅️ Refresh speed limit when step changes

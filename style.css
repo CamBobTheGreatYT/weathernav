@@ -129,14 +129,14 @@ body {
 #compass {
     width: 6vh;
     height: 6vh;
-    background: radial-gradient(circle at center, #e0f7ff 0%, #0078D7 100%);
+    background: radial-gradient(circle at center, #ccc, #333 100%);
     border-radius: 50%;
     border: 2px solid #fff;
     box-shadow: 0 0 6px rgba(0, 120, 215, 0.5);
     display: flex;
     justify-content: center;
     align-items: center;
-    color: white;
+    color: rgb(246, 35, 35);
     font-size: 1.5em;
     transform-origin: center;
     transition: transform 0.3s ease-out;

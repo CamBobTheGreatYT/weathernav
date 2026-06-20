@@ -5,6 +5,9 @@ let routeLine;
 let trackingId = null;
 let alerted = false; // Prevent repeat alerts
 let hwyRt = false;
+let prevDistanceToTurn = null;
+window.observedSpeed = null;
+window.lastLocationTime = null;
 
 // Initial location snapshot
 navigator.geolocation.getCurrentPosition(
@@ -191,6 +194,16 @@ function hasPassedManeuver(idx, userLoc) {
     return dot > 0 && distToMan > 50; // 50m buffer, tweak if needed
 }
 
+function speakNow(text) {
+    try {
+        // cancel any ongoing speech to avoid overlap for critical nav prompts
+        if (speechSynthesis.speaking) speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        speechSynthesis.speak(u);
+    } catch (e) {
+        console.warn("TTS error:", e);
+    }
+}
 
 // Begin live tracking
 function beginTracking() {
@@ -225,6 +238,29 @@ function beginTracking() {
         (pos) => {
             userLocation = [pos.coords.latitude, pos.coords.longitude];
 
+            // Compute observed speed (m/s) from last fix (exponential moving average).
+            // Prefer pos.coords.speed when available; otherwise compute distance/time.
+            const nowTs = Date.now();
+            if (window.lastLocation && window.lastLocationTime) {
+                const dt = (nowTs - window.lastLocationTime) / 1000;
+                if (dt > 0.5) {
+                    const distSince = map.distance(
+                        L.latLng(window.lastLocation[0], window.lastLocation[1]),
+                        L.latLng(userLocation[0], userLocation[1])
+                    );
+                    const instSpeed = distSince / dt; // m/s
+                    if (typeof pos.coords.speed === "number" && pos.coords.speed > 0) {
+                        window.observedSpeed = window.observedSpeed
+                            ? window.observedSpeed * 0.7 + pos.coords.speed * 0.3
+                            : pos.coords.speed;
+                    } else {
+                        window.observedSpeed = window.observedSpeed
+                            ? window.observedSpeed * 0.8 + instSpeed * 0.2
+                            : instSpeed;
+                    }
+                }
+            }
+
             const buffer = 0.005; // ~0.5km
 
             const bounds = L.latLngBounds(
@@ -233,19 +269,18 @@ function beginTracking() {
             );
             map.setMaxBounds(bounds.pad(3)); // Pad by 3x to preload a larger tile area
 
-            // Zoom and center
-            map.setView(userLocation, 16);
-
-            // Live marker
-            const userIcon = L.divIcon({
-                className: 'user-location-icon',
-                iconSize: [20, 20]
-            });
-
-            if (!window.liveMarker) {
-                window.liveMarker = L.marker(userLocation, { icon: userIcon }).addTo(map);
+            // Zoom and center — only when user has moved enough to avoid constant jumps
+            const recenterThresholdMeters = 5; // tweak as needed
+            if (!window.lastLocation) {
+                map.setView(userLocation, 16);
             } else {
-                window.liveMarker.setLatLng(userLocation);
+                const moved = map.distance(
+                    L.latLng(window.lastLocation[0], window.lastLocation[1]),
+                    L.latLng(userLocation[0], userLocation[1])
+                );
+                if (moved > recenterThresholdMeters) {
+                    map.panTo(userLocation, { animate: false });
+                }
             }
 
 
@@ -282,6 +317,7 @@ function beginTracking() {
                 document.getElementById("compass").style.transform = `rotate(${-headingDeg - 45}deg)`;
             }
             window.lastLocation = [...userLocation];
+            window.lastLocationTime = nowTs;
 
             // Save route start time if first update
             if (!window.routeStartTime) {
@@ -296,6 +332,9 @@ function beginTracking() {
                     stepIndex++;
                     alerted = false;
                     window.oneMileAlerted = false;
+                    window.fiveHundredAlerted = false;
+                    window.twoHundredAlerted = false;
+                    prevDistanceToTurn = null; // reset stored distance when step changes
                     updateNextInstruction();
                     updateInstructionList();
                     updateSpeedLimitDisplay();
@@ -309,12 +348,18 @@ function beginTracking() {
                         L.latLng(target[1], target[0])
                     );
 
-                    if (!window.oneMileAlerted && distanceToTurn > 1550 && distanceToTurn < 1650) {
-                        const text = nextStep.maneuver.instruction || `${nextStep.maneuver.type} on ${nextStep.name || "road"}`;
+                    // crossing helper
+                    const crossed = (threshold) => {
+                        return (prevDistanceToTurn !== null && prevDistanceToTurn > threshold && distanceToTurn <= threshold)
+                            || (prevDistanceToTurn === null && distanceToTurn <= threshold);
+                    };
+
+                    // One-mile alert: detect crossing 1 mile (1609.34m)
+                    const ONE_MILE_M = 1609.34;
+                    if (!window.oneMileAlerted && crossed(ONE_MILE_M)) {
                         const step = routeSteps[stepIndex];
                         const modifier = step.maneuver.modifier || "";
                         const roadName = step.name || "the road";
-
                         let directionText = "";
                         switch (modifier) {
                             case "left": directionText = "Turn left"; break;
@@ -325,16 +370,33 @@ function beginTracking() {
                             case "uturn": directionText = "Make a U-turn"; break;
                             default: directionText = step.maneuver.instruction || `${step.maneuver.type} on ${roadName}`;
                         }
-
-                        const spokenText = `${directionText} onto ${roadName}`;
-                        speechSynthesis.speak(new SpeechSynthesisUtterance(`In one mile, ${spokenText}`));
+                        speechSynthesis.speak(new SpeechSynthesisUtterance(`In one mile, ${directionText} on ${roadName}`));
                         window.oneMileAlerted = true;
+                    }
+
+                    // 500 ft and 200 ft alerts (152.4m and 61m)
+                    const FIVE_HUNDRED_M = 152.4;
+                    const TWO_HUNDRED_M = 61.0;
+
+                    if (!window.fiveHundredAlerted && crossed(FIVE_HUNDRED_M)) {
+                        const step = routeSteps[stepIndex];
+                        const txt = step.maneuver.instruction || `${step.maneuver.type} on ${step.name || "the road"}`;
+                        speechSynthesis.speak(new SpeechSynthesisUtterance(`In 500 feet, ${txt}`));
+                        window.fiveHundredAlerted = true;
+                    }
+
+                    if (!window.twoHundredAlerted && crossed(TWO_HUNDRED_M)) {
+                        const step = routeSteps[stepIndex];
+                        const txt = step.maneuver.instruction || `${step.maneuver.type} on ${step.name || "the road"}`;
+                        speechSynthesis.speak(new SpeechSynthesisUtterance(`In 200 feet, ${txt}`));
+                        window.twoHundredAlerted = true;
                     }
 
                     const prevDist = stepIndex === 0 ? 9999 : routeSteps[stepIndex - 1].distance;
                     const threshold = prevDist > 1609 ? 1609 : 321.87;
 
-                    if (!alerted && distanceToTurn < threshold + 100 && distanceToTurn > threshold - 100) {
+                    // Main maneuver alert: detect crossing threshold instead of requiring a tight band
+                    if (!alerted && crossed(threshold)) {
                         const step = routeSteps[stepIndex];
                         const modifier = step.maneuver.modifier || "";
                         const roadName = step.name || "the road";
@@ -361,13 +423,32 @@ function beginTracking() {
                     }
 
                     if (distanceToTurn < 30.48) {
+                        // Completed this maneuver → advance and immediately announce next if present
                         stepIndex++;
                         alerted = false;
                         window.oneMileAlerted = false;
+                        window.fiveHundredAlerted = false;
+                        window.twoHundredAlerted = false;
+                        prevDistanceToTurn = null; // reset when arriving at step
                         updateNextInstruction();
                         updateInstructionList();
                         updateSpeedLimitDisplay();
+
+                        if (stepIndex < routeSteps.length) {
+                            const next = routeSteps[stepIndex];
+                            const maneuverCoord = L.latLng(next.maneuver.location[1], next.maneuver.location[0]);
+                            const userCoord = L.latLng(userLocation[0], userLocation[1]);
+                            const distance = map.distance(userCoord, maneuverCoord);
+                            const distanceFormatted = formatDistance(distance);
+                            const text = next.maneuver.instruction || `${next.maneuver.type} on ${next.name || "road"}`;
+                            speechSynthesis.speak(new SpeechSynthesisUtterance(`Now: In ${distanceFormatted}, ${text}`));
+                        } else {
+                            // if we've finished last step, arrival is handled in updateNextInstruction()
+                        }
                     }
+
+                    // store previous distance for crossing detection on next update
+                    prevDistanceToTurn = distanceToTurn;
                 }
 
                 updateInstructionList();
@@ -381,10 +462,10 @@ function beginTracking() {
                     .slice(stepIndex)
                     .reduce((total, step) => total + step.distance, 0);
 
-                const avgSpeed = window.assumedSpeed || window.avgRouteSpeed || 13.4;
-                const estSecondsLeft = remainingMeters / avgSpeed;
-                const elapsedSeconds = (Date.now() - window.routeStartTime) / 1000;
-                const adjustedSecondsLeft = Math.max(estSecondsLeft - elapsedSeconds, 60);
+                const avgSpeed = window.observedSpeed || window.assumedSpeed || window.avgRouteSpeed || 13.4;
+                const clampedSpeed = Math.max(avgSpeed, 0.5); // avoid divide-by-very-small (m/s)
+                const estSecondsLeft = remainingMeters / clampedSpeed;
+                const adjustedSecondsLeft = Math.max(estSecondsLeft, 20); // floor to reasonable minimum
 
                 const now = new Date();
                 const eta = new Date(now.getTime() + adjustedSecondsLeft * 1000);
@@ -393,16 +474,17 @@ function beginTracking() {
                     minute: "2-digit"
                 });
 
-                const hours = Math.floor(adjustedSecondsLeft / 3600);
-                const minutes = Math.round((adjustedSecondsLeft % 3600) / 60);
-                const durationFormatted = hours > 0
-                    ? `${hours} hr ${minutes} min`
-                    : `${minutes} min`;
+                // compute duration text locally instead of referencing a possibly-out-of-scope variable
+                const totalHours = Math.floor(adjustedSecondsLeft / 3600);
+                const totalMinutes = Math.round((adjustedSecondsLeft % 3600) / 60);
+                const durationFormattedLocal = totalHours > 0
+                    ? `${totalHours} hr ${totalMinutes} min`
+                    : `${totalMinutes} min`;
 
                 const milesLeft = (remainingMeters / 1609.34).toFixed(1);
 
                 document.getElementById("etaText").textContent = formattedETA;
-                document.getElementById("durationText").textContent = durationFormatted;
+                document.getElementById("durationText").textContent = durationFormattedLocal;
                 document.getElementById("distanceText").textContent = `${milesLeft} mi`;
             }
 
